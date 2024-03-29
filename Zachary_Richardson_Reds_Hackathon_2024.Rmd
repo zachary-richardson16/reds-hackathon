@@ -1,0 +1,289 @@
+---
+title: "Reds Hackathon"
+author: "Zachary Richardson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+## Load packages
+library(tidyverse)
+library(xgboost)
+library(caret)
+```
+# Explore Baseball Savant Data Set
+```{r}
+## Import and inspect Baseball Savant pitching data
+pitches <- read.csv("savant_pitch_level.csv")
+
+head(pitches, 10)
+
+str(pitches)
+```
+
+
+```{r}
+## Select only necessary columns
+pitches.FINAL <- pitches %>%
+  select(c("pitcher", "pitch_type", "release_speed", "events", "description", "type", "bb_type", "on_3b", "on_2b", "on_1b", "outs_when_up", "vx0", "vy0", "vz0", "ax", "ay", "az", "launch_speed", "launch_angle", "release_spin_rate", "estimated_ba_using_speedangle", "estimated_woba_using_speedangle", "woba_value", "babip_value", "iso_value", "launch_speed_angle", "pitch_name", "delta_home_win_exp", "delta_run_exp", "pitch_number_appearance")) %>%
+  
+## Convert on-base player ID to binary value
+  mutate(on_3b = ifelse(is.na(on_3b), 0, 1), 
+         on_2b = ifelse(is.na(on_2b), 0, 1),
+         on_1b = ifelse(is.na(on_1b), 0, 1))
+
+str(pitches.FINAL)
+
+head(pitches.FINAL, 10)
+```
+
+```{r message=FALSE, warning=FALSE}
+## Create a dataframe with pitcher ID and the number of different types of pitches they throw
+pitch_types <- pitches.FINAL %>%
+  group_by(pitcher, pitch_type) %>%
+  summarise(n=n()) %>%
+  summarise(total_pitch_types = n(), total_pitches = sum(n)) %>%
+  arrange(desc(total_pitches))
+
+ggplot() +
+  geom_point(data=pitch_types, aes(x=total_pitch_types, y=total_pitches))
+
+## Inspect distribution of pitch count data
+qqnorm(pitch_types$total_pitches)
+
+hist(x=pitch_types$total_pitches)
+```
+
+
+# Explore Fangraphs Data Set
+```{r}
+## Note: `MLBAMID` == `pitcher` in the two data sets
+## Import and inspect fangraphs data set
+fangraphs <- read.csv("fangraphs_season_level.csv")
+
+head(fangraphs, 10)
+
+str(fangraphs)
+```
+
+
+
+```{r}
+## Select only necessary columns
+fangraphs2 <- fangraphs %>%
+  select(MLBAMID, Role, Pitches, K_pct, BB_pct, AVG, WHIP, BABIP, RAR, WAR, pLI, inLI, gmLI, exLI, Clutch, SwStr_pct, CStr_pct, CSW_pct, LOB_Wins, EV, LA, FA_pct, SL_pct, CT_pct, CB_pct, CH_pct, SF_pct, KN_pct, XX_pct, wFB, wSL, wCT, wCB, wCH, wSF, wKN, FA_pct_sc, FC_pct_sc, FS_pct_sc, FO_pct_sc, SI_pct_sc, SL_pct_sc, CU_pct_sc, KC_pct_sc, EP_pct_sc, CH_pct_sc, SC_pct_sc, KN_pct_sc, UN_pct_sc, wFA_sc, wFC_sc, wFS_sc, wFO_sc, wSI_sc, wSL_sc, wCU_sc, wKC_sc, wEP_sc, wCH_sc, wSC_sc, wKN_sc, wFA_per_c_sc)
+
+head(fangraphs, 10)
+```
+
+
+
+```{r}
+## Select only pitching percentage variables
+fangraphs.pitching.pct <- fangraphs2 %>%
+  select(MLBAMID, Role, Pitches, FA_pct, SL_pct, CT_pct, CB_pct, CH_pct, SF_pct, KN_pct) %>%
+  filter(Pitches >= 100)
+
+head(fangraphs.pitching.pct, 10)
+
+## Find mean pitch % for each pitch type
+mean.pitch.pct <- fangraphs.pitching.pct %>%
+  summarise_all(~mean(., na.rm=TRUE))
+mean.pitch.pct
+
+## Identify pitchers who throw at least one pitch 20% more frequently than league average
+## 20% used as arbitrary filter
+best_pitch_20 = fangraphs.pitching.pct %>%
+  group_by(MLBAMID) %>%
+  filter(Role == "SP") %>%
+  filter(FA_pct >= .70 | SL_pct >= .47 | CT_pct >= .41 | CB_pct >= .35 | CH_pct >= .35 | KN_pct >= .33)
+
+## Isolate pitching percentage variables
+pitch_pct_vars = c("FA_pct", "SL_pct", "CT_pct", "CB_pct", "CH_pct", "SF_pct", "KN_pct")
+
+## Calculate the difference between the second and third most frequent pitches thrown by each player
+## Second and third pitches chosen because of analysis which shows this is key distinction between starters and relievers
+best_pitch_20 %>%
+  rowwise() %>%
+  mutate(second_highest = sort(c_across(all_of(pitch_pct_vars)), decreasing = TRUE)[2],
+         third_highest = sort(c_across(all_of(pitch_pct_vars)), decreasing = TRUE)[3],
+         second_to_third_pct_diff = second_highest - third_highest) %>%
+  select(MLBAMID, Role, second_to_third_pct_diff, everything()) %>%
+  arrange(desc(second_to_third_pct_diff))
+```   
+
+## Classification Model using Fangraphs Data
+```{r}
+## Select specific numerical values for classification
+fangraphs.FINAL <- read.csv("fangraphs_latest_season.csv") %>%
+  select(-X)
+
+## Add label variable with role converted to a binary indicator
+table(fangraphs.FINAL$Role)
+fangraphs.FINAL$label <- NA
+fangraphs.FINAL$label[fangraphs.FINAL$Role == 'SP'] <- 0
+fangraphs.FINAL$label[fangraphs.FINAL$Role == 'RP'] <- 1
+
+head(fangraphs.FINAL)
+```
+
+
+```{r, include=FALSE}
+## Initalize empty list of misidentified players
+fangraphs.FINAL2 <- fangraphs.FINAL %>%
+  select(MLBAMID, Role, K_pct, BB_pct, WHIP, BABIP, CSW_pct, LOB_Wins, label)
+
+potential_players <- data.frame()
+
+k=0
+
+## Conduct cross validation 100 times
+while (k<100){
+  
+  ## Perform cross validation
+  TRAIN2 <- fangraphs.FINAL[sample(rownames(fangraphs.FINAL2), .80*nrow(fangraphs.FINAL2)),]
+  TEST2 <- fangraphs.FINAL[!rownames(fangraphs.FINAL2) %in% rownames(TRAIN2),]
+  
+  ## Create k folds
+  num_folds <- 5
+  folds <- createFolds(TRAIN2$label, k = num_folds)
+  
+  ## Set up a list to store the results
+  results <- list()
+  
+  ## Perform cross-validation
+  for (i in 1:num_folds) {
+    
+    ## Extract the training and validation data for this fold
+    train_data <- TRAIN2[-folds[[i]], ]
+    valid_data <- TRAIN2[folds[[i]], ]
+    
+    ## Convert the data to the DMatrix format used by xgboost
+    train_dmatrix <- xgb.DMatrix(data = as.matrix(train_data[, 3:14]), label = train_data$label)
+    valid_dmatrix <- xgb.DMatrix(data = as.matrix(valid_data[, 3:14]), label = valid_data$label)
+    
+    ## Train the model
+    xgb_model <- xgb.train(data = train_dmatrix, 
+                           nrounds = 5, 
+                           num_class = 2)
+    
+    ## Make predictions on the validation data
+    valid_data$predicted <- predict(xgb_model, valid_dmatrix)
+    
+    ## Convert the predicted labels to category names
+    valid_data$predicted[valid_data$predicted == 0] <- "SP"
+    valid_data$predicted[valid_data$predicted == 1] <- "RP"
+    
+    ## Calculate the accuracy of the predictions
+    valid_data$check <- valid_data$Role == valid_data$predicted
+    accuracy <- sum(valid_data$check) / nrow(valid_data)
+    
+    ## Store the results
+    results[[i]] <- accuracy
+    
+    potential_players <- rbind(potential_players, valid_data[valid_data$Role==valid_data$predicted, ])
+  }
+  
+  k = k + 1
+  print(k)
+
+}
+## Calculate and print the mean accuracy across all folds
+mean_accuracy <- mean(unlist(results))
+print(paste("Mean accuracy:", round(mean_accuracy, 4)))
+
+## Construct a confusion matrix to see predicted vs actual values
+conf_mat.2 <- table( valid_data$Role, valid_data$predicted)
+
+rownames(conf_mat.2) <- c("Predicted SP", "Predicted RP")
+colnames(conf_mat.2) <- c("Actual SP", "Actual RP")
+
+conf_mat.2
+```
+
+## Identify Misclassified Players
+```{r}
+misunderstood_players <- potential_players %>%
+  group_by(MLBAMID) %>%
+  filter(Role=="SP") %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count)) %>%
+  filter(Count>=85)
+
+pitches %>%
+  filter(pitcher %in% misunderstood_players$MLBAMID) %>%
+  group_by(player_name) %>%
+  summarise()
+```
+
+```{r message=FALSE, warning=FALSE}
+temp <- pitches %>%
+  group_by(pitcher) %>%
+  filter(pitcher %in% misunderstood_players$MLBAMID) %>%
+  summarise()
+
+## Pitchers misidentified every time by Python classification model
+temp2 <- c(453284, 453343, 572070, 489265, 641501, 621248, 658551, 600921, 640448, 623474, 621016, 671345, 656290, 661403, 657265, 670174, 686294, 686753, 456034, 459429, 572125, 606424, 663378, 519043, 622072, 667463, 677053, 476594, 545333, 605452, 607231, 640464, 650668, 668968, 434671, 501381, 544931, 592717, 595191, 595939, 664141, 663734, 643290, 643615, 661269, 650530, 664161, 666120, 660623, 663554, 661563, 676720, 685503, 425844, 425794, 446372, 434378, 594798, 570632, 607968, 543037, 548389, 621107, 592332, 607192, 641771, 608566, 641793, 605540, 657053, 656629, 657093, 664028, 663474, 621076, 656818, 664353, 656302, 658648, 669947, 641712, 669203, 669854, 657140, 669160, 660271, 656412, 656557, 668676, 669330, 676477, 666159, 660593, 642216, 657746, 663372, 663623, 665622, 665795, 668881, 670912, 672710, 672851, 675627, 676130, 676775, 680689, 681190, 663562, 686613, 670241, 682990, 687830, 671131, 683155, 666201, 679525, 677944, 683175, 686730, 691587, 671212, 686218, 700363, 681217, 668909, 695243, 673540, 431148, 676606, 656954, 642028, 676879, 518516, 543548, 592662, 542881, 605483, 607644, 656794, 605488, 663465, 641778, 660761, 666205, 650911, 663460, 666142, 669373, 674681, 674072, 666157, 672282, 694363, 674003, 686610)
+
+temp3 <- temp %>% 
+  filter(pitcher %in% temp2)
+
+temp4 <- fangraphs %>%
+  group_by(MLBAMID) %>%
+  filter(MLBAMID %in% temp3$pitcher) %>%
+  summarise(Name) %>%
+  unique()
+
+pitches %>% 
+  filter(pitcher %in% temp4$MLBAMID) %>%
+  group_by(player_name) %>%
+  summarise(role_key) %>%
+  unique()
+
+## Jake Irvin, Alek Manoah labeled as only SP in the data set but fit the bill of RP
+```
+
+# Player Evaluation
+## Jake Irvin
+```{r}
+## Inspect pitch percentages
+fangraphs.pitching.pct %>%
+  filter(MLBAMID == 663623)
+
+## We see 20% difference in second-third pitch which we showed previously was
+## a drop-off point for a reliever
+
+fangraphs %>%
+  filter(MLBAMID == 663623)
+
+mean(fangraphs$wCH, na.rm=TRUE)
+
+## We also see a highly negative wFB metric, which indicates a good fastball and
+## weaker other pitches
+```
+
+
+## Alek Manoah
+```{r}
+## Inspect pitch percentages
+fangraphs.pitching.pct %>%
+  filter(MLBAMID == 666201)
+
+## We see 20% difference in second-third pitch which we showed previously was
+## a drop-off point for a reliever
+
+fangraphs %>%
+  filter(MLBAMID == 666201)
+
+mean(fangraphs$wCB, na.rm=TRUE)
+mean(fangraphs$wCH, na.rm=TRUE)
+
+## We also see a highly negative wFB metric, which indicates a good fastball and
+## weaker other pitches
+```
+
